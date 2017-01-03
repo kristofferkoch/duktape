@@ -160,6 +160,8 @@ def blue(text):
     return ansi_color(text, '0;37;44')
 def yellow(text):
     return ansi_color(text, '0;33;40')
+def grey(text):
+    return ansi_color(text, '6;37;40')
 
 # Parse lines.  Split a text input into lines using LF as the line separator.
 # Assume last line is terminated with a LF and ignore an "empty line" that
@@ -199,6 +201,47 @@ def clip_lines(lines, start_idx, end_idx, column_limit=None):
 # Remove carriage returns.
 def remove_cr(data):
     return data.replace('\r', '')
+
+#
+#  Valgrind result processing
+#
+
+def parse_massif_result(f, res):
+    # Allocated bytes.
+    re_heap_b = re.compile(r'^mem_heap_B=(\d+)$')
+
+    # Allocation overhead.  Matters for desktop environments, for efficient
+    # zero overhead pool allocators this is not usually a concern (the waste
+    # in a pool allocator behaves very differently than a libc allocator).
+    re_heap_extra_b = re.compile(r'^mem_heap_extra_B=(\d+)$')
+
+    # Stacks.
+    re_stacks_b = re.compile(r'^mem_stacks_B=(\d+)$')
+
+    peak_heap = 0
+    peak_stack = 0
+
+    for line in f:
+        line = line.strip()
+        #print(line)
+        m1 = re_heap_b.match(line)
+        m2 = re_heap_extra_b.match(line)
+        m3 = re_stacks_b.match(line)
+
+        heap = None
+        if m1 is not None:
+            heap = int(m1.group(1))
+        stack = None
+        if m3 is not None:
+            stack = int(m3.group(1))
+
+        if heap is not None:
+            peak_heap = max(peak_heap, heap)
+        if stack is not None:
+            peak_stack = max(peak_stack, stack)
+
+    res['massif_peak_heap_bytes'] = peak_heap
+    res['massif_peak_stack_bytes'] = peak_stack
 
 #
 #  Test execution and result interpretation helpers.
@@ -423,20 +466,32 @@ def execute_ecmascript_testcase(res, data, name):
     test_fn = os.path.abspath(os.path.join(tempdir, name))
     write_file(test_fn, data)
 
+    massif_output = None
+
     cmd = []
     try:
         start_time = time.time()
         try:
             if opts.valgrind:
                 res['valgrind'] = True
-                cmd += [ 'valgrind', path_to_platform(opts.duk) ]
+                res['valgrind_tool'] = opts.valgrind_tool
+                cmd += [ 'valgrind' ]
+                cmd += [ '--tool=' + opts.valgrind_tool ]
+                if opts.valgrind_tool == 'massif':
+                    massif_output = os.path.abspath(os.path.join(tempdir, 'massif.out'))
+                    cmd += [ '--massif-out-file=' + path_to_platform(massif_output) ]
+                    #cmd += [ '--peak-inaccuracy=0.0' ]
+                    #cmd += [ '--stacks=yes' ]
+                else:
+                    pass
+                cmd += [ path_to_platform(os.path.abspath(opts.duk)) ]
             else:
-                cmd += [ opts.duk ]
-            cmd += [ path_to_platform(test_fn) ]
+                cmd += [ os.path.abspath(opts.duk) ]
+            cmd += [ path_to_platform(os.path.abspath(test_fn)) ]
             res['command'] = cmd
 
             #print('Executing: %r' % cmd)
-            proc = subprocess.Popen(cmd, stdin=None, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            proc = subprocess.Popen(cmd, stdin=None, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=os.path.abspath(tempdir))
 
             timeout_sec = opts.timeout
             def kill_proc(p):
@@ -458,6 +513,9 @@ def execute_ecmascript_testcase(res, data, name):
             if opts.valgrind:
                 res['valgrind_output'] = ret[1]
                 res['stderr'] = ''  # otherwise interpreted as an error
+                if massif_output is not None:
+                    with open(massif_output, 'rb') as f:
+                        parse_massif_result(f, res)
         except:
             exc_type, exc_value, exc_traceback = sys.exc_info()
             print('Command execution failed for %r:\n%s' % (cmd, traceback.format_exc(exc_traceback)))
@@ -554,6 +612,12 @@ def print_summary(doc):
     else:
         parts += [ test_time ]
 
+    if doc.has_key('massif_peak_heap_bytes'):
+        parts += [ '[%.2fk heap, %.2fk stack]' % (float(doc['massif_peak_heap_bytes']) / 1024.0, float(doc['massif_peak_stack_bytes']) / 1024.0) ]
+
+    if doc.has_key('valgrind_tool'):
+        parts += [ grey('[%s]' % doc['valgrind_tool']) ]
+
     print(' '.join(parts))
 
     if doc['stderr'] != '' and not meta.get('intended_uncaught', False):
@@ -604,6 +668,7 @@ def main():
     parser.add_option('--duk', dest='duk', default=None, help='Path to "duk" command, default is autodetect')
     parser.add_option('--timeout', dest='timeout', type='int', default=15*60, help='Test execution timeout (seconds), default 15min')
     parser.add_option('--valgrind', dest='valgrind', action='store_true', default=False, help='Run test inside valgrind')
+    parser.add_option('--valgrind-tool', dest='valgrind_tool', default=None, help='Valgrind tool to use (implies --valgrind)')
     parser.add_option('--prepare-only', dest='prepare_only', action='store_true', default=False, help='Only prepare a testcase without running it')
     parser.add_option('--clip-lines', dest='clip_lines', type='int', default=10, help='Number of lines for stderr/diff summaries')
     parser.add_option('--clip-columns', dest='clip_columns', type='int', default=80, help='Number of columns for stderr/diff summaries')
@@ -623,6 +688,10 @@ def main():
     if opts.known_issues is None:
         opts.known_issues = find_known_issues()
         #print('Autodetect known issues directory: %r' % opts.known_issues)
+    if opts.valgrind_tool is not None:
+        opts.valgrind = True
+    if opts.valgrind and opts.valgrind_tool is None:
+        opts.valgrind_tool = 'memcheck'
 
     # Create a temporary directory for anything test related, automatic
     # atexit deletion.  Plumbed through globals to minimize argument passing.
